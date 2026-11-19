@@ -196,7 +196,3 @@ nwu-toolkit/
 ## 许可
 
 MIT License
-
-## 贡献
-
-欢迎西北大学的同学 Fork 并提 PR。使用前请确保你已阅读 README 中的注意事项。

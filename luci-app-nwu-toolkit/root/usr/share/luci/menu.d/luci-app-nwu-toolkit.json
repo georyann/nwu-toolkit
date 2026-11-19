@@ -1,0 +1,39 @@
+{
+	"admin/services/nwu-toolkit": {
+		"title": "校园网助手",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-nwu-toolkit" ]
+		}
+	},
+
+	"admin/services/nwu-toolkit/netlogin": {
+		"title": "校园网自动登录",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "nwu-toolkit/netlogin"
+		}
+	},
+
+	"admin/services/nwu-toolkit/daka": {
+		"title": "晚点名打卡",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "nwu-toolkit/daka"
+		}
+	},
+
+	"admin/services/nwu-toolkit/status": {
+		"title": "运行状态",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "nwu-toolkit/status"
+		}
+	}
+}

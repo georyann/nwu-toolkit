@@ -1,0 +1,594 @@
+#!/bin/sh
+# 西北大学晚点名自动打卡（多用户，支持独立位置 / UA / 推送）
+#   nwu-daka daemon          常驻运行：每天到点等待开放后自动打卡
+#   nwu-daka run [section]   立即打卡：不等待，只尝试一次
+#
+# 依赖：curl、jsonfilter
+
+. /usr/lib/nwu-toolkit/common.sh
+
+DEFAULT_UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) daka-script'
+CAMPUS_LAT=34.14522
+CAMPUS_LNG=108.87618
+RUN_MARK="$NWU_DATA_DIR/daka/last-run"
+LOCK_DIR="$NWU_STATE_DIR/daka.lock"
+# 与 nwu-netlogin 共用：置位后自动重登守护进程暂停，避免把打卡用的账号抢回去
+NETLOGIN_HOLD="$NWU_STATE_DIR/netlogin.hold"
+
+say() { nwu_log "daka: $*"; }
+
+load_conf() {
+	BASE=$(nwu_get daka.base 'https://xddz.nwu.edu.cn')
+	TIME=$(nwu_get daka.time '20:55')
+	JITTER=$(nwu_get daka.jitter 600)
+	PUSH_MODE=$(nwu_get daka.push_mode 'unified')
+	UNIFIED_BARK=$(nwu_get daka.unified_bark '')
+	BARK_SERVER=$(nwu_get daka.bark_server 'https://api.day.app')
+	ENABLED=$(nwu_get daka.enabled 0)
+	SWITCH_WIFI=$(nwu_get daka.switch_wifi 1)
+	RECONNECT=$(nwu_get daka.reconnect 1)
+	SWITCH_MAC=$(nwu_get daka.switch_mac 1)
+	RESTORE=$(nwu_get daka.restore 1)
+
+	case "$SWITCH_WIFI" in 1|on|true|yes) SWITCH_WIFI=1 ;; *) SWITCH_WIFI=0 ;; esac
+	case "$RECONNECT" in 1|on|true|yes) RECONNECT=1 ;; *) RECONNECT=0 ;; esac
+	case "$SWITCH_MAC" in 1|on|true|yes) SWITCH_MAC=1 ;; *) SWITCH_MAC=0 ;; esac
+	case "$RESTORE" in 1|on|true|yes) RESTORE=1 ;; *) RESTORE=0 ;; esac
+
+	case "$TIME" in
+		[0-2][0-9]:[0-5][0-9]) ;;
+		*) TIME='20:55' ;;
+	esac
+	case "$JITTER" in ''|*[!0-9]*) JITTER=600 ;; esac
+	case "$PUSH_MODE" in
+		each|unified|both|off) ;;
+		*) PUSH_MODE='unified' ;;
+	esac
+	BASE=${BASE%/}
+}
+
+list_enabled_users() {
+	local s out=''
+	for s in $(nwu_sections user); do
+		nwu_list_enabled "$s" && out="$out $s"
+	done
+	printf '%s' "${out# }"
+}
+
+phase_text() {
+	case "$1" in
+		open) printf '打卡进行中' ;;
+		before) printf '尚未开始' ;;
+		after) printf '今日已结束' ;;
+		day) printf '今日无需打卡' ;;
+		*) printf '晚点名未开启' ;;
+	esac
+}
+
+fetch_meta() {
+	META=$(nwu_http_json "$BASE/__rc/meta" '' "$DEFAULT_UA" 15)
+	[ -n "$META" ]
+}
+
+meta_get() { nwu_json_get "$1" "$META"; }
+
+describe_location() { # lat lng
+	awk -v lat="$1" -v lng="$2" -v clat="$CAMPUS_LAT" -v clng="$CAMPUS_LNG" 'BEGIN {
+		dy = (lat - clat) * 111.0
+		dx = (lng - clng) * 111.0 * 0.829
+		d = sqrt(dx * dx + dy * dy) * 1000
+		if (d <= 3000)
+			printf "西北大学长安校区（%.5f, %.5f）", lat, lng
+		else
+			printf "自定义位置（%.5f, %.5f）", lat, lng
+	}'
+}
+
+# 校区中心 50 米内随机漂移，返回 "lat lng"
+drift_location() {
+	local dy dx
+	dy=$(nwu_rand_range 100)
+	dx=$(nwu_rand_range 100)
+	awk -v clat="$CAMPUS_LAT" -v clng="$CAMPUS_LNG" -v dy=$((dy - 50)) -v dx=$((dx - 50)) 'BEGIN {
+		printf "%.5f %.5f", clat + dy / 111320, clng + dx / (111320 * 0.829)
+	}'
+}
+
+bark_push() { # key title body [server]
+	local key="$1" title="$2" body="$3" srv="${4:-https://api.day.app}"
+	[ -n "$key" ] || return 0
+	srv=${srv%/}
+	curl -s -m 12 --connect-timeout 5 \
+		"$srv/$key/$(nwu_urlencode "$title")/$(nwu_urlencode "$body")?group=$(nwu_urlencode '校园打卡')&level=active&isArchive=1" \
+		-o /dev/null 2>&1
+}
+
+# 内置 UA 池：用户未填写 UA 时，第一次运行随机取一个并固定下来，
+# 既保证每人 UA 不同，也避免所有人共用内置的同一个 UA 被判定为同一设备。
+ua_pool_at() {
+	case "$1" in
+	0) printf '%s' 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1' ;;
+	1) printf '%s' 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1' ;;
+	2) printf '%s' 'Mozilla/5.0 (Linux; Android 14; 23127PN0CC Build/UKQ1.230804.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/124.0.6367.82 Mobile Safari/537.36' ;;
+	3) printf '%s' 'Mozilla/5.0 (Linux; Android 13; PGT-AN10 Build/HONORPGT-AN10; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/119.0.6045.163 Mobile Safari/537.36' ;;
+	4) printf '%s' 'Mozilla/5.0 (Linux; Android 14; V2309A Build/UP1A.231005.007; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/125.0.6422.147 Mobile Safari/537.36' ;;
+	5) printf '%s' 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0' ;;
+	6) printf '%s' 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36' ;;
+	7) printf '%s' 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15' ;;
+	8) printf '%s' 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' ;;
+	9) printf '%s' 'Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1' ;;
+	*) printf '%s' "$DEFAULT_UA" ;;
+	esac
+}
+
+# 取该用户固定的 UA：配置里填了就用配置，否则首次随机分配并落盘复用
+user_ua() { # section
+	local ua_file="$NWU_DATA_DIR/daka/$1.ua" i n cand other
+	if [ -s "$ua_file" ]; then
+		cat "$ua_file"
+		return 0
+	fi
+	i=0
+	while [ "$i" -lt 8 ]; do
+		n=$(nwu_rand_range 9)
+		cand=$(ua_pool_at "$n")
+		other=0
+		for f in "$NWU_DATA_DIR"/daka/*.ua; do
+			[ -f "$f" ] || continue
+			[ "$f" = "$ua_file" ] && continue
+			[ "$(cat "$f")" = "$cand" ] && other=1
+		done
+		if [ "$other" = '0' ]; then
+			printf '%s' "$cand" >"$ua_file"
+			printf '%s' "$cand"
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	printf '%s' "$cand" >"$ua_file"
+	printf '%s' "$cand"
+}
+
+save_user_state() { # file dev tok toksid ldate ltime lresult lmsg
+	printf '{"dev_rand":"%s","tok":"%s","tok_sid":"%s","last_date":"%s","last_time":"%s","last_result":"%s","last_msg":"%s"}\n' \
+		"$2" "$3" "$4" "$5" "$6" \
+		"$(nwu_json_escape "$7")" "$(nwu_json_escape "$8")" >"$1"
+}
+
+# 每用户固定的本地管理 MAC（02:xx:...），首次生成后保持不变
+user_mac() { # section
+	local f="$NWU_DATA_DIR/daka/$1.mac" b
+	if [ -s "$f" ]; then
+		cat "$f"
+		return 0
+	fi
+	b=$(od -An -N5 -tu1 -v /dev/urandom 2>/dev/null)
+	# shellcheck disable=SC2086
+	printf '02:%02x:%02x:%02x:%02x:%02x\n' $b >"$f"
+	cat "$f"
+}
+
+wan_ip() {
+	ip -4 route get 1.1.1.1 2>/dev/null |
+		awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}'
+}
+
+# 打卡前切到本人校园网账号：保证提交请求来自本人 MAC + IP
+switch_wifi_account() { # name user pass [mac] [reconnect]
+	local out rc
+	: >"$NETLOGIN_HOLD"
+	out=$(/usr/bin/nwu-netlogin switch "$2" "$3" "$4" "$5" 2>&1)
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		say "$1：校园网切换为 $2（${out:-已登录}）"
+	else
+		say "$1：校园网切换失败（${out:-未知错误}），仍尝试打卡"
+	fi
+	return $rc
+}
+
+restore_wifi_account() {
+	local i=0
+	[ -e "$NETLOGIN_HOLD" ] || return 0
+	rm -f "$NETLOGIN_HOLD"
+	# 恢复原始 WAN MAC（会触发一次重连）
+	/usr/bin/nwu-netlogin mac-restore >/dev/null 2>&1
+	while [ "$i" -lt 20 ] && [ -z "$(wan_ip)" ]; do
+		sleep 2
+		i=$((i + 1))
+	done
+	if [ "$RESTORE" = '1' ]; then
+		say '恢复默认校园网账号'
+		/usr/bin/nwu-netlogin once >/dev/null 2>&1
+	fi
+}
+
+# 单个用户打卡。结果写入全局 U_* 变量供汇总使用
+run_user() { # section
+	local sec="$1" state sid name phone idc lat lng loc_mode ua bark push wifi_user wifi_pass mac
+	local dev rand tok tok_sid collect body resp ok code msg ms v zone dist
+	local ldate ltime lresult lmsg now loc extra win
+
+	U_NAME='未知'
+	U_OK=0
+	U_RESULT='失败'
+	U_MSG=''
+	U_TITLE='✗ 晚点名打卡失败'
+
+	sid=$(uci -q get "nwu-toolkit.$sec.sid")
+	name=$(uci -q get "nwu-toolkit.$sec.name")
+	phone=$(uci -q get "nwu-toolkit.$sec.phone")
+	idc=$(uci -q get "nwu-toolkit.$sec.idc")
+	lat=$(uci -q get "nwu-toolkit.$sec.lat")
+	lng=$(uci -q get "nwu-toolkit.$sec.lng")
+	loc_mode=$(uci -q get "nwu-toolkit.$sec.loc_mode")
+	case "$loc_mode" in
+		school|custom) ;;
+		*) # 未设置时按是否有坐标推断，兼容旧配置
+			if [ -n "$lat" ] && [ -n "$lng" ]; then loc_mode='custom'; else loc_mode='school'; fi
+			;;
+	esac
+	ua=$(uci -q get "nwu-toolkit.$sec.ua")
+	bark=$(uci -q get "nwu-toolkit.$sec.bark")
+	push=$(uci -q get "nwu-toolkit.$sec.push")
+	wifi_user=$(uci -q get "nwu-toolkit.$sec.wifi_user")
+	wifi_pass=$(uci -q get "nwu-toolkit.$sec.wifi_pass")
+
+	if [ -z "$sid" ] || [ -z "$name" ]; then
+		U_NAME="${name:-$sec}"
+		U_RESULT='未配置'
+		U_MSG='缺少学号或姓名'
+		say "$sec：未填写学号/姓名，跳过"
+		return 2
+	fi
+	U_NAME="$name"
+	[ -n "$push" ] || push=1
+	# 未填写 UA 时从内置池随机分配并固定，避免所有用户共用同一个 UA
+	[ -n "$ua" ] || ua=$(user_ua "$sec")
+
+	# 默认位置：校区中心 50 米内随机漂移；自填位置则原样使用
+	if [ "$loc_mode" = 'school' ]; then
+		loc=$(drift_location)
+		lat=${loc% *}
+		lng=${loc#* }
+	fi
+
+	# 先切到本人的校园网账号，再提交打卡（同一 IP / 同一 MAC 为多人打卡会被拒绝）
+	if [ "$SWITCH_WIFI" = '1' ] && [ -n "$wifi_user" ] && [ -n "$wifi_pass" ]; then
+		mac=''
+		[ "$SWITCH_MAC" = '1' ] && mac=$(user_mac "$sec")
+		switch_wifi_account "$name" "$wifi_user" "$wifi_pass" "$mac" "$RECONNECT"
+	fi
+
+	state="$NWU_DATA_DIR/daka/$sec.json"
+	[ -r "$state" ] || printf '{}\n' >"$state"
+	chmod 600 "$state" 2>/dev/null
+
+	rand=$(nwu_file_json_get "$state" '@.dev_rand')
+	tok=$(nwu_file_json_get "$state" '@.tok')
+	tok_sid=$(nwu_file_json_get "$state" '@.tok_sid')
+	ldate=$(nwu_file_json_get "$state" '@.last_date')
+	ltime=$(nwu_file_json_get "$state" '@.last_time')
+	lresult=$(nwu_file_json_get "$state" '@.last_result')
+	lmsg=$(nwu_file_json_get "$state" '@.last_msg')
+
+	if [ -z "$rand" ]; then
+		rand=$(nwu_rand_hex 7)
+		save_user_state "$state" "$rand" "$tok" "$tok_sid" "$ldate" "$ltime" "$lresult" "$lmsg"
+	fi
+	[ "$tok_sid" = "$sid" ] || tok=''
+
+	dev=$(nwu_dev_hash "$rand|$ua|0x0|24|zh-CN|-480")
+	collect=$(meta_get '@.collect')
+
+	# 1) 身份绑定（同一学号已有令牌则跳过）
+	if [ -z "$tok" ]; then
+		body="{\"sid\":\"$(nwu_json_escape "$sid")\",\"name\":\"$(nwu_json_escape "$name")\",\"dev\":\"$dev\""
+
+		if [ "$collect" = 'true' ] && { [ -n "$phone" ] || [ -n "$idc" ]; }; then
+			[ -n "$phone" ] && body="$body,\"phone\":\"$(nwu_json_escape "$phone")\""
+			[ -n "$idc" ] && body="$body,\"idc\":\"$(nwu_json_escape "$idc")\""
+			body="$body,\"consent\":true"
+		fi
+		body="$body}"
+
+		resp=$(nwu_http_json "$BASE/__rc/bind" "$body" "$ua" 20)
+		if [ "$(nwu_json_get '@.ok' "$resp")" = 'true' ]; then
+			tok=$(nwu_json_get '@.tok' "$resp")
+			tok_sid="$sid"
+			save_user_state "$state" "$rand" "$tok" "$tok_sid" "$ldate" "$ltime" "$lresult" "$lmsg"
+			say "$name：身份绑定成功"
+		else
+			code=$(nwu_json_get '@.code' "$resp")
+			msg=$(nwu_json_get '@.msg' "$resp")
+			say "$name：身份绑定未通过（${code:-net}${msg:+：$msg}），尝试直接打卡"
+		fi
+	fi
+
+	# 2) 提交打卡
+	body="{\"sid\":\"$(nwu_json_escape "$sid")\",\"name\":\"$(nwu_json_escape "$name")\",\"dev\":\"$dev\",\"ua\":\"other\""
+	[ -n "$tok" ] && body="$body,\"tok\":\"$(nwu_json_escape "$tok")\""
+	if nwu_is_number "$lat" && nwu_is_number "$lng"; then
+		body="$body,\"lat\":$lat,\"lng\":$lng,\"acc\":50"
+	fi
+	body="$body}"
+
+	resp=$(nwu_http_json "$BASE/__rc/checkin" "$body" "$ua" 20)
+	ok=$(nwu_json_get '@.ok' "$resp")
+	code=$(nwu_json_get '@.code' "$resp")
+	msg=$(nwu_json_get '@.msg' "$resp")
+	ms=$(nwu_json_get '@.ms' "$resp")
+	v=$(nwu_json_get '@.v' "$resp")
+	zone=$(nwu_json_get '@.zone' "$resp")
+	dist=$(nwu_json_get '@.dist' "$resp")
+
+	if nwu_is_number "$lat" && nwu_is_number "$lng"; then
+		loc=$(describe_location "$lat" "$lng")
+	else
+		loc='未上报位置'
+	fi
+	win=''
+	if [ -n "$(meta_get '@.win[0]')" ]; then
+		win="$(meta_get '@.win[0]')–$(meta_get '@.win[1]')"
+	fi
+
+	if [ "$ok" = 'true' ]; then
+		U_OK=1
+		U_TITLE='✓ 晚点名打卡成功'
+		U_RESULT="成功（${ms}）"
+		U_MSG="${v}${zone:+ · $zone}"
+		say "$name：打卡成功 · ${ms} · ${v}${zone:+ · $zone}"
+		extra="核验：${v}${zone:+ · $zone}"
+	elif [ "$code" = 'dup' ]; then
+		U_OK=1
+		U_TITLE='晚点名：今日已打卡'
+		U_RESULT='已打卡（重复提交）'
+		U_MSG="$msg"
+		say "$name：今日已打卡，无需重复提交"
+		extra='今日已打卡，无需重复提交'
+	else
+		U_TITLE='✗ 晚点名打卡失败'
+		U_RESULT="失败（${code:-net}）"
+		U_MSG="$msg"
+		case "$code" in
+			devonce) msg="$msg（一台设备一天只能为一人打卡，请确认本用户 UA 未被他人共用）" ;;
+			out) msg="$msg（还差约 ${dist:-?} 米）" ;;
+			acc) msg="$msg（定位精度不足，可稍后重试）" ;;
+			gps) msg="$msg（定位无效）" ;;
+			'') msg='无法连接打卡服务' ;;
+		esac
+		say "$name：打卡未通过（${code:-net}）：$msg"
+		extra="$msg"
+	fi
+
+	now=$(date '+%Y-%m-%d %H:%M:%S')
+	save_user_state "$state" "$rand" "$tok" "$tok_sid" \
+		"$(date '+%Y-%m-%d')" "$now" "$U_RESULT" "$msg"
+
+	# 3) 每人单独推送
+	if [ "$PUSH_MODE" = 'each' ] || [ "$PUSH_MODE" = 'both' ]; then
+		if [ "$push" = '1' ]; then
+			bark_push "$bark" "$U_TITLE" \
+				"${name}（${sid}）
+${extra}${win:+
+时段：$win}
+位置：$loc" \
+				"$BARK_SERVER"
+		fi
+	fi
+
+	[ "$U_OK" = '1' ]
+}
+
+wait_for_open() {
+	local phase start delay now deadline
+	deadline=$(( $(date +%s) + 14400 )) # 最多等待 4 小时，避免锁死
+	while :; do
+		if [ "$(date +%s)" -gt "$deadline" ]; then
+			say '等待打卡开放超时（4 小时），今日放弃'
+			return 1
+		fi
+		if ! fetch_meta; then
+			say '无法获取打卡服务状态，10 分钟后重试'
+			sleep 600
+			continue
+		fi
+		phase=$(meta_get '@.phase')
+		[ "$phase" = 'open' ] && return 0
+
+		if [ "$(meta_get '@.on')" != 'true' ]; then
+			say "晚点名未开启（$(phase_text "$phase")），10 分钟后复查"
+			sleep 600
+			continue
+		fi
+
+		start=$(meta_get '@.startTs')
+		case "$start" in ''|*[!0-9]*) start=0 ;; esac
+		now=$(date +%s)
+		delay=$(( start / 1000 - now ))
+		if [ "$start" -le 0 ] || [ "$delay" -le 0 ]; then
+			say '尚未开放，10 分钟后复查'
+			sleep 600
+			continue
+		fi
+
+		say "距打卡开放还有 $((delay / 60)) 分钟"
+		if [ "$delay" -gt 60 ]; then
+			sleep 60
+		else
+			sleep "$delay"
+		fi
+	done
+}
+
+run_all() { # wait(1/0)
+	local users sec rc total=0 okcnt=0 summary='' delay
+
+	users=$(list_enabled_users)
+	if [ -z "$users" ]; then
+		say '没有启用的打卡用户'
+		return 1
+	fi
+
+	if ! fetch_meta; then
+		say '无法连接打卡服务'
+		return 1
+	fi
+	if [ "$1" = '1' ]; then
+		wait_for_open || return 1
+	fi
+
+	if [ "$(meta_get '@.phase')" != 'open' ]; then
+		say "当前不可打卡：$(phase_text "$(meta_get '@.phase')")"
+		return 1
+	fi
+
+	# 只有自动任务才做随机延迟，手动“立即打卡”直接提交
+	if [ "$1" = '1' ] && [ "$JITTER" -gt 0 ]; then
+		delay=$(nwu_rand_range "$JITTER")
+		if [ "$delay" -gt 0 ]; then
+			say "随机延迟 ${delay} 秒后提交"
+			sleep "$delay"
+		fi
+	fi
+
+	for sec in $users; do
+		total=$((total + 1))
+		run_user "$sec"
+		rc=$?
+		[ "$U_OK" = '1' ] && okcnt=$((okcnt + 1))
+		summary="${summary}${U_NAME}：${U_RESULT}
+"
+	done
+
+	restore_wifi_account
+
+	if [ "$PUSH_MODE" = 'unified' ] || [ "$PUSH_MODE" = 'both' ]; then
+		if [ -n "$UNIFIED_BARK" ]; then
+			bark_push "$UNIFIED_BARK" \
+				"晚点名打卡汇总（${okcnt}/${total} 成功）" \
+				"$summary" "$BARK_SERVER"
+		fi
+	fi
+
+	say "本轮完成：${okcnt}/${total} 成功"
+	[ "$okcnt" -gt 0 ]
+}
+
+hms_to_sec() {
+	local h m s
+	h=$(date +%H); m=$(date +%M); s=$(date +%S)
+	h=${h#0}; m=${m#0}; s=${s#0}
+	[ -n "$h" ] || h=0
+	[ -n "$m" ] || m=0
+	[ -n "$s" ] || s=0
+	echo $(( h * 3600 + m * 60 + s ))
+}
+
+today_target() { # HH:MM -> 今天的该时刻（epoch）
+	local hh mm now sod
+	hh=${1%%:*}
+	mm=${1##*:}
+	hh=${hh#0}
+	mm=${mm#0}
+	[ -n "$hh" ] || hh=0
+	[ -n "$mm" ] || mm=0
+	now=$(date +%s)
+	sod=$(hms_to_sec)
+	echo $(( now - sod + hh * 3600 + mm * 60 ))
+}
+
+daemon() {
+	nwu_init_dirs
+	say '打卡守护进程启动'
+	while :; do
+		load_conf
+		if [ "$ENABLED" != '1' ]; then
+			sleep 60
+			continue
+		fi
+
+		now=$(date +%s)
+		target=$(today_target "$TIME")
+		last=$(cat "$RUN_MARK" 2>/dev/null)
+
+		# 到点后 2 小时内且今天尚未执行 → 打卡（兼顾路由器重启）
+		if [ "$now" -ge "$target" ] && [ "$now" -lt $((target + 7200)) ] &&
+			[ "$last" != "$(date '+%Y-%m-%d')" ]; then
+			if nwu_lock "$LOCK_DIR"; then
+				mark=$(date '+%Y-%m-%d')
+				printf '%s\n' "$mark" >"$RUN_MARK"
+				if ! run_all 1; then
+					# 一个都没成功（如断网），撤销今日标记，10 分钟后重试
+					[ "$(cat "$RUN_MARK" 2>/dev/null)" = "$mark" ] && rm -f "$RUN_MARK"
+					nwu_unlock "$LOCK_DIR"
+					sleep 600
+					continue
+				fi
+				nwu_unlock "$LOCK_DIR"
+			fi
+			sleep 60
+		else
+			sleep 30
+		fi
+	done
+}
+
+cmd_run() {
+	local sec="$1" rc phase
+	nwu_init_dirs
+	load_conf
+
+	[ "$sec" = 'all' ] && sec=''
+	if ! nwu_lock "$LOCK_DIR"; then
+		say '已有打卡任务在运行，跳过'
+		return 1
+	fi
+
+	if [ -n "$sec" ]; then
+		if ! fetch_meta; then
+			say '无法连接打卡服务'
+			nwu_unlock "$LOCK_DIR"
+			return 1
+		fi
+		phase=$(meta_get '@.phase')
+		if [ "$phase" != 'open' ]; then
+			say "当前不可打卡：$(phase_text "$phase")"
+			nwu_unlock "$LOCK_DIR"
+			return 1
+		fi
+		run_user "$sec"
+		rc=$?
+		restore_wifi_account
+	else
+		run_all 0
+		rc=$?
+	fi
+
+	nwu_unlock "$LOCK_DIR"
+	return $rc
+}
+
+cmd_status() {
+	local s
+	nwu_init_dirs
+	load_conf
+	echo "打卡计划：每天 $TIME（随机延迟 0–${JITTER} 秒）"
+	echo "推送模式：$PUSH_MODE"
+	echo "今日已执行：$(cat "$RUN_MARK" 2>/dev/null || echo 未执行)"
+	fetch_meta || { echo '无法连接打卡服务'; return 1; }
+	echo "服务端状态：$(phase_text "$(meta_get '@.phase')")（$(meta_get '@.now')）"
+	for s in $(nwu_sections user); do
+		echo "  $s	$(uci -q get "nwu-toolkit.$s.name")	$(nwu_file_json_get "$NWU_DATA_DIR/daka/$s.json" '@.last_time')	$(nwu_file_json_get "$NWU_DATA_DIR/daka/$s.json" '@.last_result')"
+	done
+}
+
+case "$1" in
+	daemon) daemon ;;
+	run) cmd_run "$2" ;;
+	status) cmd_status ;;
+	*)
+		echo "用法: $0 daemon|run [section|all]|status" >&2
+		exit 1
+		;;
+esac

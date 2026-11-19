@@ -1,0 +1,47 @@
+# 校园网助手（luci-app-nwu-toolkit）
+# 校园网自动登录 + 晚点名自动打卡
+
+config netlogin 'netlogin'
+	option enabled '0'
+	option interval '60'
+	option switch_interval '0'
+	option failover '1'
+	option portal 'http://172.30.9.18:801'
+	option portal_domain 'http://calogin.nwu.edu.cn:801'
+	option ua 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+config daka 'daka'
+	option enabled '0'
+	option time '20:55'
+	option jitter '600'
+	option push_mode 'unified'
+	option unified_bark ''
+	option bark_server 'https://api.day.app'
+	option base 'https://xddz.nwu.edu.cn'
+	option switch_wifi '1'
+	option switch_mac '1'
+	option reconnect '1'
+	option restore '1'
+
+# 账号示例（在 LuCI 页面里添加更好，无需手改）
+# config account 'acc1'
+# 	option enabled '1'
+# 	option name '主账号'
+# 	option username '学号或上网账号'
+# 	option password '密码'
+
+# 打卡用户示例
+# config user 'u1'
+# 	option enabled '1'
+# 	option name '张三'
+# 	option sid '20230001'
+# 	option phone ''
+# 	option idc ''
+# 	option lat '34.14522'
+# 	option lng '108.87618'
+# 	option loc_mode 'school'
+# 	option ua 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) daka-script'
+# 	option push '1'
+# 	option bark ''
+# 	option wifi_user '本人的校园网上网账号'
+# 	option wifi_pass '本人的校园网密码'

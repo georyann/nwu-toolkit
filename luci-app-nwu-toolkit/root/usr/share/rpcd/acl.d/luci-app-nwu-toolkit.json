@@ -1,0 +1,17 @@
+{
+	"luci-app-nwu-toolkit": {
+		"description": "校园网助手：自动登录与晚点名打卡",
+		"read": {
+			"ubus": {
+				"nwu-toolkit": [ "status", "log" ]
+			},
+			"uci": [ "nwu-toolkit" ]
+		},
+		"write": {
+			"ubus": {
+				"nwu-toolkit": [ "netlogin_now", "daka_now", "restart" ]
+			},
+			"uci": [ "nwu-toolkit" ]
+		}
+	}
+}

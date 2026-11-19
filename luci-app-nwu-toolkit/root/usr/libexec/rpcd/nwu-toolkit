@@ -1,0 +1,160 @@
+#!/bin/sh
+# LuCI 后端（ubus 对象 nwu-toolkit）
+#   status        读取运行状态
+#   log           读取日志尾部
+#   netlogin_now  立即执行一轮校园网认证
+#   daka_now      立即打卡（section 为空表示全部用户）
+#   restart       重启守护进程（service: netlogin|daka|all）
+
+. /usr/share/libubox/jshn.sh
+. /usr/lib/nwu-toolkit/common.sh
+
+read_input() {
+	local input
+	input=$(cat 2>/dev/null)
+	json_init
+	[ -n "$input" ] && json_load "$input" 2>/dev/null
+}
+
+trigger() { # 后台触发，立即返回，避免 ubus 调用超时
+	if command -v setsid >/dev/null 2>&1; then
+		setsid "$@" >/dev/null 2>&1 &
+	else
+		nohup "$@" >/dev/null 2>&1 &
+	fi
+}
+
+bool_out() { # 条件命令的结果转 0/1
+	if "$@"; then printf '1'; else printf '0'; fi
+}
+
+# rpcd 约定：list 列出方法；call <method> 时参数 JSON 由 stdin 传入
+case "$1" in
+list)
+	json_init
+	json_add_object 'status'
+	json_close_object
+	json_add_object 'log'
+	json_add_string 'lines' 'integer'
+	json_close_object
+	json_add_object 'netlogin_now'
+	json_close_object
+	json_add_object 'daka_now'
+	json_add_string 'section' 'string'
+	json_close_object
+	json_add_object 'restart'
+	json_add_string 'service' 'string'
+	json_close_object
+	json_dump
+	exit 0
+	;;
+call)
+	METHOD="$2"
+	;;
+*)
+	METHOD="$1"
+	;;
+esac
+
+read_input
+
+case "$METHOD" in
+status)
+	NET_RUN=$(bool_out nwu_service_running netlogin)
+	DAKA_RUN=$(bool_out nwu_service_running daka)
+	NET_EN=$(bool_out nwu_bool netlogin.enabled)
+	DAKA_EN=$(bool_out nwu_bool daka.enabled)
+	NET_COUNT=$(nwu_sections account | wc -l | tr -d ' ')
+	DAKA_COUNT=$(nwu_sections user | wc -l | tr -d ' ')
+	TODAY=$(date '+%Y-%m-%d')
+	RUN_MARK=$(cat "$NWU_DATA_DIR/daka/last-run" 2>/dev/null)
+
+	json_init
+
+	json_add_object 'netlogin'
+	json_add_boolean 'running' "$NET_RUN"
+	json_add_boolean 'enabled' "$NET_EN"
+	json_add_int 'accounts' "$NET_COUNT"
+	json_add_string 'account' "$(nwu_file_json_get "$NWU_STATE_DIR/netlogin.json" '@.account')"
+	json_add_string 'user' "$(nwu_file_json_get "$NWU_STATE_DIR/netlogin.json" '@.user')"
+	json_add_string 'result' "$(nwu_file_json_get "$NWU_STATE_DIR/netlogin.json" '@.result')"
+	json_add_string 'msg' "$(nwu_file_json_get "$NWU_STATE_DIR/netlogin.json" '@.msg')"
+	json_add_string 'time' "$(nwu_file_json_get "$NWU_STATE_DIR/netlogin.json" '@.time')"
+	json_add_int 'interval' "$(nwu_uint netlogin.interval 60)"
+	json_add_int 'switch_interval' "$(nwu_uint netlogin.switch_interval 0)"
+	json_add_string 'portal' "$(nwu_get netlogin.portal '')"
+	json_close_object
+
+	json_add_object 'daka'
+	json_add_boolean 'running' "$DAKA_RUN"
+	json_add_boolean 'enabled' "$DAKA_EN"
+	json_add_int 'users' "$DAKA_COUNT"
+	json_add_string 'time' "$(nwu_get daka.time '20:55')"
+	json_add_int 'jitter' "$(nwu_uint daka.jitter 600)"
+	json_add_string 'push_mode' "$(nwu_get daka.push_mode 'unified')"
+	json_add_boolean 'today_done' "$( [ "$RUN_MARK" = "$TODAY" ] && printf 1 || printf 0 )"
+	json_add_array 'user'
+	for sec in $(nwu_sections user); do
+		state="$NWU_DATA_DIR/daka/$sec.json"
+		json_add_object ''
+		json_add_string 'section' "$sec"
+		json_add_string 'name' "$(uci -q get "nwu-toolkit.$sec.name")"
+		json_add_string 'sid' "$(uci -q get "nwu-toolkit.$sec.sid")"
+		json_add_boolean 'enabled' "$(bool_out nwu_list_enabled "$sec")"
+		json_add_string 'last_time' "$(nwu_file_json_get "$state" '@.last_time')"
+		json_add_string 'last_result' "$(nwu_file_json_get "$state" '@.last_result')"
+		json_add_string 'last_msg' "$(nwu_file_json_get "$state" '@.last_msg')"
+		json_close_object
+	done
+	json_close_array
+	json_close_object
+
+	json_dump
+	;;
+
+log)
+	json_get_var lines lines
+	case "$lines" in ''|*[!0-9]*) lines=200 ;; esac
+	json_init
+	json_add_string 'log' "$(tail -n "$lines" "$NWU_LOG" 2>/dev/null)"
+	json_dump
+	;;
+
+netlogin_now)
+	trigger /usr/bin/nwu-netlogin once
+	json_init
+	json_add_boolean 'ok' 1
+	json_add_string 'msg' '已触发校园网认证'
+	json_dump
+	;;
+
+daka_now)
+	json_get_var section section
+	trigger /usr/bin/nwu-daka run "${section:-all}"
+	json_init
+	json_add_boolean 'ok' 1
+	json_add_string 'msg' '已触发打卡'
+	json_dump
+	;;
+
+restart)
+	json_get_var service service
+	case "$service" in
+		netlogin) /etc/init.d/nwu-netlogin restart ;;
+		daka) /etc/init.d/nwu-daka restart ;;
+		*)
+			/etc/init.d/nwu-netlogin restart
+			/etc/init.d/nwu-daka restart
+			;;
+	esac
+	json_init
+	json_add_boolean 'ok' 1
+	json_add_string 'msg' '服务已重启'
+	json_dump
+	;;
+
+*)
+	echo '{}'
+	exit 1
+	;;
+esac

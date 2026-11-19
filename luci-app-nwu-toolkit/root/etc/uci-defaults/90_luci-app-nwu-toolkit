@@ -1,0 +1,11 @@
+#!/bin/sh
+# 首次安装：确保配置文件存在并注册开机自启（服务在启用开关打开前处于空转状态）
+
+[ -f /etc/config/nwu-toolkit ] || touch /etc/config/nwu-toolkit
+mkdir -p /etc/nwu-toolkit/daka
+chmod 700 /etc/nwu-toolkit
+
+/etc/init.d/nwu-netlogin enable
+/etc/init.d/nwu-daka enable
+
+exit 0

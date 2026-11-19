@@ -245,7 +245,6 @@ setup_luci() {
                 err "未找到 install.sh"
                 return 1
             fi
-            cp "$SCRIPT_DIR/luci-app-nwu-toolkit/install.sh" "$TARGET_DIR/../install.sh" 2>/dev/null || true
             echo ""
             echo -e "  请手动在本地运行："
             echo -e "    sh $SCRIPT_DIR/luci-app-nwu-toolkit/install.sh $host"
