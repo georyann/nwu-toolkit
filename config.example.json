@@ -1,0 +1,10 @@
+{
+  "student_id": "YOUR_STUDENT_ID",
+  "name": "YOUR_NAME",
+  "phone": "",
+  "id_card": "",
+  "lat": 34.14522,
+  "lng": 108.87618,
+  "bark_key": "",
+  "bark_server": "https://api.day.app"
+}

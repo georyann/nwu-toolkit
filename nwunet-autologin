@@ -1,0 +1,139 @@
+#!/bin/sh
+# NWUNET 校园网自动认证守护脚本（西北大学 Dr.COM 网页认证）
+# 认证地址：http://calogin.nwu.edu.cn:801/eportal/portal/login
+#
+# 用法：
+#   nwunet-autologin        常驻运行，每 INTERVAL 秒检测一次，断网自动重登
+#   nwunet-autologin once   只检测并尝试登录一次，用于手动调试
+#
+# 依赖：curl（OpenWrt 上执行 opkg install curl）
+# 配置：/etc/nwunet.conf
+
+CONF="${CONF:-/etc/nwunet.conf}"
+[ -r "$CONF" ] && . "$CONF"
+
+USERNAME="${USERNAME:-}"
+PASSWORD="${PASSWORD:-}"
+# 认证服务器：优先用 IP 直连。路由器 DNS 被 Tailscale 接管时域名解析不出来，
+# 会导致脚本误判"找不到认证服务器"，所以默认走固定 IP
+PORTAL="${PORTAL:-http://172.30.9.18:801}"
+PORTAL_DOMAIN="${PORTAL_DOMAIN:-http://calogin.nwu.edu.cn:801}"
+INTERVAL="${INTERVAL:-60}"
+UA="${UA:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36}"
+
+say() { echo "[nwunet] $*"; }
+
+# 认证服务器是否存活：loadConfig 只要返回 JSONP（含 "code"）即可
+is_portal() {
+    body=$(curl -s -m 5 --connect-timeout 3 "$1/eportal/portal/page/loadConfig?callback=dr1" 2>/dev/null)
+    case "$body" in
+        *'"code"'*) return 0 ;;
+    esac
+    return 1
+}
+
+# 自动探测认证服务器地址，输出 http://host:port 形式
+detect_portal() {
+    # 1) 配置中已指定（默认 IP 直连，DOMAIN 为别名兜底）
+    for c in "$PORTAL" "$PORTAL_DOMAIN"; do
+        [ -n "$c" ] || continue
+        if is_portal "$c"; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+
+    # 2) 从未认证时被劫持的 HTTP 响应里提取 /eportal 地址
+    # 同时用固定 IP，避免断网时 DNS 不可用导致探测失败
+    for u in http://www.baidu.com http://connectivitycheck.gstatic.com/generate_204 \
+             http://1.1.1.1 http://110.242.68.66; do
+        resp=$(curl -s -m 6 --connect-timeout 3 -D - "$u" 2>/dev/null)
+        [ -n "$resp" ] || continue
+        base=$(printf '%s' "$resp" | grep -oE "http[^\"' <>]*/eportal" | head -n1 | sed 's#/eportal.*##')
+        if [ -n "$base" ] && is_portal "$base"; then
+            printf '%s' "$base"
+            return 0
+        fi
+    done
+
+    # 3) 依次尝试默认网关、西北大学已知认证地址及其常见端口
+    gw=$(ip route 2>/dev/null | awk '/^default/{print $3; exit}')
+    for c in "$gw" "$gw:801" "$gw:8081" 172.30.9.18:801 172.30.9.18 \
+             10.16.0.12:8081 10.0.1.165 10.0.1.165:801 10.0.1.242 10.0.1.242:801; do
+        [ -n "$c" ] || continue
+        if is_portal "http://$c"; then
+            printf 'http://%s' "$c"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# 向认证服务器提交账号密码
+do_login() {
+    portal="$1"
+
+    resp=$(curl -s -m 12 --connect-timeout 4 -G "$portal/eportal/portal/login" \
+        -H 'Referer: http://calogin.nwu.edu.cn/' \
+        -H "User-Agent: $UA" \
+        --data-urlencode "user_account=$USERNAME" \
+        --data-urlencode "user_password=$PASSWORD" \
+        --data "login_method=1" \
+        --data "terminal_type=1" \
+        --data "lang=zh-cn" \
+        --data "callback=dr1" \
+        --data "jsVersion=4.2.1" 2>/dev/null)
+
+    case "$resp" in
+        *'"result":1'*|*'"result":"ok"'*)
+            say "认证成功"
+            return 0
+            ;;
+        *'"ret_code":2'*)
+            say "该 IP 已在线"
+            return 0
+            ;;
+        *)
+            msg=$(printf '%s' "$resp" | sed -n 's/.*"msg":"\([^"]*\)".*/\1/p' | head -n1)
+            say "认证失败：${msg:-$resp}"
+            return 1
+            ;;
+    esac
+}
+
+# 周期性直接认证。Dr.COM 的登录接口是幂等的：
+# 已在线时返回 result:1 或 ret_code:2，不会中断现有会话，
+# 所以不再依赖"能否访问外网"来判断，彻底避开 DNS 失效导致的误判
+check_once() {
+    portal=$(detect_portal)
+    if [ -z "$portal" ]; then
+        say "认证服务器不可达（$PORTAL），请确认路由器已连上 NWUNET"
+        return 1
+    fi
+
+    do_login "$portal"
+}
+
+main() {
+    if ! command -v curl >/dev/null 2>&1; then
+        say "缺少 curl，请先执行：opkg install curl"
+        exit 1
+    fi
+    if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+        say "请先在 $CONF 中配置 USERNAME 和 PASSWORD"
+        exit 1
+    fi
+
+    if [ "$1" = "once" ]; then
+        check_once
+        exit $?
+    fi
+
+    while :; do
+        check_once >/dev/null 2>&1
+        sleep "$INTERVAL"
+    done
+}
+
+main "$@"

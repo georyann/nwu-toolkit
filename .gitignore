@@ -1,0 +1,17 @@
+# 运行时配置文件（含敏感信息，绝不上传）
+config.json
+state.json
+nwunet.conf
+*.log
+*.pid
+
+# 系统/IDE 生成文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# python
+__pycache__/
+*.pyc

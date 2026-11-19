@@ -1,0 +1,13 @@
+# NWUNET 校园网自动认证守护脚本 · 配置示例
+# 复制为 /etc/nwunet.conf 后修改：cp nwunet.conf.example /etc/nwunet.conf && chmod 600 /etc/nwunet.conf
+#
+# 用户名 / 密码：你的校园网账号（默认：学号）和密码（默认：身份证后 6 位，字母 X 大写）
+USERNAME="YOUR_STUDENT_ID"
+PASSWORD="YOUR_PASSWORD"
+# 认证服务器：用 IP 直连（calogin.nwu.edu.cn 在部分时段/网段解析不出来）
+PORTAL="http://172.30.9.18:801"
+PORTAL_DOMAIN="http://calogin.nwu.edu.cn:801"
+# 检测间隔（秒）
+INTERVAL=30
+# User-Agent（仅用于模拟浏览器，可留空）
+# UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
